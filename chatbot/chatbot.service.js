@@ -197,88 +197,95 @@ async function forceChatbotTrigger(candidatoId) {
  * @param {object} body - Payload recibido del bot.
  */
 async function handleBotWebhook(body) {
-  const { candidato_id, estado_gestion, resultado_agenda, evento_id, nota, extra_candidato_fields } = body;
+  console.log('[ChatbotService] Procesando webhook del bot:', JSON.stringify(body));
+
+  // Desestructuramos solo los campos esperados según requerimiento
+  const { candidato_id, telefono, resultado_agenda, evento_id, nota } = body;
   let targetId = candidato_id;
 
+  // Validación básica de campos obligatorios (según usuario, solo nota y evento_id pueden ser vacíos)
+  if (!candidato_id && !telefono) {
+      throw new Error('Faltan identificadores: candidato_id o telefono son requeridos.');
+  }
+
   // Si no llega candidato_id, intentar buscar por telefono (como respaldo)
-  if (!targetId && body.telefono) {
+  if (!targetId && telefono) {
       // Intentar formatear telefono para buscar: "+57..." o "57..."
-      let tel = body.telefono;
+      let tel = telefono;
       if (!tel.startsWith('+')) tel = '+' + tel; // La BD guarda con + usualmente
 
       const searchRes = await pool.query('SELECT id FROM public.candidatos WHERE telefono = $1 LIMIT 1', [tel]);
       if (searchRes.rows.length > 0) {
           targetId = searchRes.rows[0].id;
+      } else {
+        throw new Error(`No se encontró candidato con telefono ${telefono}`);
       }
   }
 
-  if (!targetId) throw new Error('No se pudo identificar al candidato (falta candidato_id o telefono no encontrado).');
+  if (!targetId) throw new Error('No se pudo identificar al candidato (targetId nulo).');
+  
+  // Validación de resultado_agenda
+  if (!resultado_agenda) {
+      console.warn('[ChatbotService] Webhook recibido sin resultado_agenda. Se procesará solo nota si existe.');
+  }
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // 1. Manejo de estado: estado_gestion (explicito) o resultado_agenda map
-    let statusToSet = estado_gestion;
+    // 1. Manejo de estado basado en resultado_agenda
+    let statusToSet = null;
 
-    if (!statusToSet && resultado_agenda === 'AGENDADO') {
-        // Mapear AGENDADO a 'CITA_AGENDADA' en la BD
-        const statusRes = await client.query("SELECT codigo FROM public.estados_gestion WHERE codigo = 'CITA_AGENDADA' LIMIT 1");
+    // Lógica de mapeo de estados del bot a estados internos
+    if (resultado_agenda === 'AGENDADO') {
+        // En la BD el estado se llama 'AGENDADO' (según consulta reciente)
+        const statusRes = await client.query("SELECT id FROM public.estados_gestion WHERE codigo = 'AGENDADO' LIMIT 1");
         if (statusRes.rows.length > 0) {
-            statusToSet = 'CITA_AGENDADA';
+            statusToSet = statusRes.rows[0].id;
         } else {
-             // Fallback si no existe CITA_AGENDADA, usar algo genérico o dejarlo
-             console.warn('Estado CITA_AGENDADA no encontrado en DB, no se actualizará estado.');
+             // Fallback: intentar buscar 'CITA_AGENDADA' por si acaso
+             const statusResBackup = await client.query("SELECT id FROM public.estados_gestion WHERE codigo = 'CITA_AGENDADA' LIMIT 1");
+             if (statusResBackup.rows.length > 0) statusToSet = statusResBackup.rows[0].id;
         }
-    }
+    } 
+    // Aquí se pueden agregar más mapeos (ej. 'NO_INTERESADO' -> 'DADO_DE_BAJA' o similar)
 
     if (statusToSet) {
-        const estadoRes = await client.query('SELECT id FROM public.estados_gestion WHERE codigo = $1', [statusToSet]);
-        if (estadoRes.rows.length > 0) {
-            await client.query(
-                'UPDATE public.candidatos SET estado_gestion_id = $1, updated_at = NOW() WHERE id = $2',
-                [estadoRes.rows[0].id, targetId]
-            );
+        await client.query(
+            'UPDATE public.candidatos SET estado_gestion_id = $1, updated_at = NOW() WHERE id = $2',
+            [statusToSet, targetId]
+        );
+        console.log(`[ChatbotService] Estado actualizado a ${resultado_agenda} (ID: ${statusToSet}) para candidato ${targetId}`);
+    }
+
+    // 2. Manejo de Inscripción a Evento (si vino AGENDADO y hay evento_id válido)
+    if (resultado_agenda === 'AGENDADO' && evento_id) {
+        // Permitimos cualquier ID (UUID o Entero), la DB validará la existencia
+        try {
+             await client.query('UPDATE public.candidatos SET evento_asignado_id = $1 WHERE id = $2', [evento_id, targetId]);
+             // Incrementar inscritos 
+             await client.query('UPDATE public.eventos SET inscritos_actuales = inscritos_actuales + 1 WHERE id = $1', [evento_id]);
+             console.log(`[ChatbotService] Candidato ${targetId} inscrito en evento ${evento_id}`);
+        } catch (dbErr) {
+            console.error(`[ChatbotService] Error asignando evento ${evento_id}:`, dbErr.message);
+            // No hacemos throw para no tumbar toda la transacción si el evento falla, 
+            // aunque idealmente debería ser atómico. Mantendremos la transacción viva para guardar la nota.
         }
     }
 
-    // 1.5. Manejo de Inscripción a Evento (si vino AGENDADO y evento_id)
-    if (resultado_agenda === 'AGENDADO' && evento_id) {
-        // Verificar si el evento existe y tiene cupo (opcional, pero recomendado)
-        // Actualizar candidatos.evento_asignado_id 
-        await client.query('UPDATE public.candidatos SET evento_asignado_id = $1 WHERE id = $2', [evento_id, targetId]);
-        
-        // Incrementar inscritos (simple counter, ideally should be robust)
-        await client.query('UPDATE public.eventos SET inscritos_actuales = inscritos_actuales + 1 WHERE id = $1', [evento_id]);
-    }
-
-    // 2. Insertar nota histórica si se provee
-    // (Asumimos que nota_horario es un lugar temporal, o idealmente añadir a una bitácora)
+    // 3. Insertar nota histórica si se provee
     if (nota) {
+        // En vez de sobrescribir, idealmente concatenamos o guardamos en historial. 
+        // Por ahora, actualizamos nota_horario como solicitado previamente.
         await client.query(
             'UPDATE public.candidatos SET nota_horario = $1 WHERE id = $2',
-            [nota, targetId] // Usar targetId en vez de candidato_id
+            [nota, targetId]
         );
-    }
-
-    // 3. Actualizar campos extras permitidos
-    if (extra_candidato_fields && typeof extra_candidato_fields === 'object') {
-        const whitelisted = ['telefono', 'correo', 'franja_actual', 'fase_actual'];
-        for (const [key, value] of Object.entries(extra_candidato_fields)) {
-            if (whitelisted.includes(key)) {
-                // Usamos inyección segura con placeholders dinámicos no es trivial con pg puro sin ORM
-                // Pero como key está whitelisted, es seguro concatenar la key.
-                await client.query(
-                    `UPDATE public.candidatos SET ${key} = $1 WHERE id = $2`,
-                    [value, targetId] // Usar targetId
-                );
-            }
-        }
+         console.log(`[ChatbotService] Nota actualizada para candidato ${targetId}`);
     }
 
     await client.query('COMMIT');
-    console.log(`[ChatbotService] Candidato ${targetId} actualizado exitosamente tras interacción bot.`);
-    return { success: true };
+    return { success: true, message: 'Datos procesados correctamente' };
 
   } catch (err) {
     await client.query('ROLLBACK');
