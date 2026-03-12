@@ -46,9 +46,10 @@ const pool = new Pool({
   ...poolConfig,
   // Para Supabase (conexión directa) un pool de 5-10 conexiones es suficiente.
   // El plan gratuito de Supabase tiene un máximo de ~60 conexiones simultáneas.
-  max:                    10,
-  idleTimeoutMillis:      30_000,
-  connectionTimeoutMillis: 8_000,
+  max:                    5,             // Reduciendo a 5 para evitar saturate en dev
+  idleTimeoutMillis:      10_000,        // Liberar conexiones idle más rápido
+  connectionTimeoutMillis: 60_000,       // Aumentar timeout a 60s para redes muy lentas o bloqueadas
+  keepAlive:              true,          // Mantener conexión viva
 });
 
 pool.on('connect', () => {
@@ -60,4 +61,3 @@ pool.on('error', (err) => {
 });
 
 module.exports = pool;
-

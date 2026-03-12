@@ -2,6 +2,7 @@
 'use strict';
 
 const axios = require('axios');
+const https = require('https');
 // Ajustar ruta relativa al pool de la base de datos
 const pool = require('../src/db/pool');
 
@@ -119,6 +120,7 @@ async function gatherCandidateData(candidatoId) {
 
   // Payload final
   return {
+    candidato_id: candidate.id, // Requerido por el chatbot para saber a quién actualizar luego
     telefono: candidate.telefono ? candidate.telefono.replace('+', '') : '', // Quitar '+' si existe
     nombre: candidate.nombre,
     motivo: candidate.fase_actual, // Asumimos fase_actual es el motivo (ej. ENTREVISTA)
@@ -136,8 +138,19 @@ async function gatherCandidateData(candidatoId) {
 async function sendToChatbot(payload) {
   try {
     console.log(`[ChatbotService] Enviando datos de usuario ${payload.nombre} a ${CHATBOT_WEBHOOK_URL}...`);
+    
+    // Configurar agente HTTPS para evitar errores de certificado con ngrok/dev
+    const agent = new https.Agent({  
+      rejectUnauthorized: false
+    });
+
     const response = await axios.post(CHATBOT_WEBHOOK_URL, payload, {
-      timeout: 10000 // 10s timeout
+      timeout: 10000, // 10s timeout
+      httpsAgent: agent,
+      headers: {
+        'ngrok-skip-browser-warning': 'true', // Salta la pantalla de advertencia de ngrok gratuito
+        'User-Agent': 'SofIA-Bot/2.0'
+      }
     });
     console.log(`[ChatbotService] Respuesta del bot: ${response.status}`);
     return response.data;
@@ -184,24 +197,59 @@ async function forceChatbotTrigger(candidatoId) {
  * @param {object} body - Payload recibido del bot.
  */
 async function handleBotWebhook(body) {
-  const { candidato_id, estado_gestion, nota, extra_candidato_fields } = body;
+  const { candidato_id, estado_gestion, resultado_agenda, evento_id, nota, extra_candidato_fields } = body;
+  let targetId = candidato_id;
 
-  if (!candidato_id) throw new Error('Falta candidato_id en el payload.');
+  // Si no llega candidato_id, intentar buscar por telefono (como respaldo)
+  if (!targetId && body.telefono) {
+      // Intentar formatear telefono para buscar: "+57..." o "57..."
+      let tel = body.telefono;
+      if (!tel.startsWith('+')) tel = '+' + tel; // La BD guarda con + usualmente
+
+      const searchRes = await pool.query('SELECT id FROM public.candidatos WHERE telefono = $1 LIMIT 1', [tel]);
+      if (searchRes.rows.length > 0) {
+          targetId = searchRes.rows[0].id;
+      }
+  }
+
+  if (!targetId) throw new Error('No se pudo identificar al candidato (falta candidato_id o telefono no encontrado).');
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // 1. Actualizar estado de gestión si se provee
-    if (estado_gestion) {
-        // Encontrar ID del estado primero (lookup simple)
-        const estadoRes = await client.query('SELECT id FROM public.estados_gestion WHERE codigo = $1', [estado_gestion]);
+    // 1. Manejo de estado: estado_gestion (explicito) o resultado_agenda map
+    let statusToSet = estado_gestion;
+
+    if (!statusToSet && resultado_agenda === 'AGENDADO') {
+        // Mapear AGENDADO a 'CITA_AGENDADA' en la BD
+        const statusRes = await client.query("SELECT codigo FROM public.estados_gestion WHERE codigo = 'CITA_AGENDADA' LIMIT 1");
+        if (statusRes.rows.length > 0) {
+            statusToSet = 'CITA_AGENDADA';
+        } else {
+             // Fallback si no existe CITA_AGENDADA, usar algo genérico o dejarlo
+             console.warn('Estado CITA_AGENDADA no encontrado en DB, no se actualizará estado.');
+        }
+    }
+
+    if (statusToSet) {
+        const estadoRes = await client.query('SELECT id FROM public.estados_gestion WHERE codigo = $1', [statusToSet]);
         if (estadoRes.rows.length > 0) {
             await client.query(
                 'UPDATE public.candidatos SET estado_gestion_id = $1, updated_at = NOW() WHERE id = $2',
-                [estadoRes.rows[0].id, candidato_id]
+                [estadoRes.rows[0].id, targetId]
             );
         }
+    }
+
+    // 1.5. Manejo de Inscripción a Evento (si vino AGENDADO y evento_id)
+    if (resultado_agenda === 'AGENDADO' && evento_id) {
+        // Verificar si el evento existe y tiene cupo (opcional, pero recomendado)
+        // Actualizar candidatos.evento_asignado_id 
+        await client.query('UPDATE public.candidatos SET evento_asignado_id = $1 WHERE id = $2', [evento_id, targetId]);
+        
+        // Incrementar inscritos (simple counter, ideally should be robust)
+        await client.query('UPDATE public.eventos SET inscritos_actuales = inscritos_actuales + 1 WHERE id = $1', [evento_id]);
     }
 
     // 2. Insertar nota histórica si se provee
@@ -209,7 +257,7 @@ async function handleBotWebhook(body) {
     if (nota) {
         await client.query(
             'UPDATE public.candidatos SET nota_horario = $1 WHERE id = $2',
-            [nota, candidato_id]
+            [nota, targetId] // Usar targetId en vez de candidato_id
         );
     }
 
@@ -222,14 +270,14 @@ async function handleBotWebhook(body) {
                 // Pero como key está whitelisted, es seguro concatenar la key.
                 await client.query(
                     `UPDATE public.candidatos SET ${key} = $1 WHERE id = $2`,
-                    [value, candidato_id]
+                    [value, targetId] // Usar targetId
                 );
             }
         }
     }
 
     await client.query('COMMIT');
-    console.log(`[ChatbotService] Candidato ${candidato_id} actualizado exitosamente tras interacción bot.`);
+    console.log(`[ChatbotService] Candidato ${targetId} actualizado exitosamente tras interacción bot.`);
     return { success: true };
 
   } catch (err) {
@@ -245,5 +293,6 @@ module.exports = {
   processCandidateCallFail,
   handleBotWebhook,
   forceChatbotTrigger,
-  sendToChatbot
+  sendToChatbot,
+  gatherCandidateData // Exportada para debug
 };
